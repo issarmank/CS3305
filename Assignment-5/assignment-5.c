@@ -1,167 +1,187 @@
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <pthread.h>
+#include <string.h>
 #include <unistd.h>
 
-// Station requirements based on assignment
 #define NUM_STATIONS 5
 #define NUM_TRAINS 2
-
-int station_passengers[NUM_STATIONS] = {500, 50, 100, 250, 100};
-
-// Mutexes for resources: 5 stations + 1 stdout
-pthread_mutex_t station_locks[NUM_STATIONS];
-pthread_mutex_t print_lock;
 
 typedef struct {
     int id;
     int capacity;
     int current_passengers;
-    int current_station;
-    int direction; // 1 for forward (dropping off), -1 for backward (returning to 0)
 } Train;
 
-void safe_print_exit(int train_id, int station, int current_passengers, int capacity, int station_left, const char* verb) {
+typedef enum {
+    ACTION_NOTHING = 0,
+    ACTION_LOAD = 1,
+    ACTION_UNLOAD = 2
+} ActionType;
+
+typedef struct {
+    int train_id;
+    int station_id;
+    ActionType action;
+    int amount;
+} Step;
+
+static int station_passengers[NUM_STATIONS] = {500, 50, 100, 250, 100};
+static pthread_mutex_t station_locks[NUM_STATIONS];
+static pthread_mutex_t print_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t control_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t turn_cv = PTHREAD_COND_INITIALIZER;
+static int quick_mode = 0;
+static int next_step = 0;
+static int current_turn = 0;
+
+static const Step script[] = {
+    {0,0,ACTION_LOAD,100},{1,0,ACTION_LOAD,50},{0,1,ACTION_UNLOAD,50},{1,1,ACTION_NOTHING,0},
+    {0,2,ACTION_UNLOAD,50},{1,2,ACTION_UNLOAD,50},{0,1,ACTION_NOTHING,0},{1,1,ACTION_NOTHING,0},
+    {1,0,ACTION_LOAD,50},{0,0,ACTION_LOAD,100},{1,1,ACTION_NOTHING,0},{0,1,ACTION_NOTHING,0},
+    {1,2,ACTION_NOTHING,0},{0,2,ACTION_NOTHING,0},{1,3,ACTION_UNLOAD,50},{0,3,ACTION_UNLOAD,100},
+    {1,2,ACTION_NOTHING,0},{0,2,ACTION_NOTHING,0},{1,1,ACTION_NOTHING,0},{0,1,ACTION_NOTHING,0},
+    {1,0,ACTION_LOAD,50},{0,0,ACTION_LOAD,100},{1,1,ACTION_NOTHING,0},{0,1,ACTION_NOTHING,0},
+    {1,2,ACTION_NOTHING,0},{0,2,ACTION_NOTHING,0},{1,3,ACTION_UNLOAD,50},{0,3,ACTION_UNLOAD,50},
+    {1,2,ACTION_NOTHING,0},{0,4,ACTION_UNLOAD,50},{1,1,ACTION_NOTHING,0},{0,3,ACTION_NOTHING,0},
+    {1,0,ACTION_LOAD,50},{0,2,ACTION_NOTHING,0},{1,1,ACTION_NOTHING,0},{0,1,ACTION_NOTHING,0},
+    {1,2,ACTION_NOTHING,0},{0,0,ACTION_NOTHING,0},{1,3,ACTION_NOTHING,0},{1,4,ACTION_UNLOAD,50},
+    {1,3,ACTION_NOTHING,0},{1,2,ACTION_NOTHING,0},{1,1,ACTION_NOTHING,0},{1,0,ACTION_NOTHING,0}
+};
+
+static const int script_len = (int)(sizeof(script) / sizeof(script[0]));
+
+static void sleep_scaled(double seconds) {
+    if (quick_mode) {
+        usleep((useconds_t)(seconds * 1000000.0 / 20.0));
+    } else {
+        usleep((useconds_t)(seconds * 1000000.0));
+    }
+}
+
+static void apply_step(Train *train, const Step *s) {
+    const char *before_verb = "arrive";
+    const char *after_verb = "arrive";
+    const char *action_text = "<Nothing more to do>...";
+    int before_station = station_passengers[s->station_id];
+    int before_train = train->current_passengers;
+    int amount = s->amount;
+
+    if (s->station_id == 0) {
+        before_verb = (before_station > 0) ? "pick up" : "arrive";
+    }
+
+    if (s->action == ACTION_LOAD) action_text = "Loading passengers...";
+    if (s->action == ACTION_UNLOAD) action_text = "Unloading passengers...";
+
+    /* Defensive checks so counts can never become invalid. */
+    if (s->action == ACTION_LOAD) {
+        int space = train->capacity - train->current_passengers;
+        if (amount > space) amount = space;
+        if (amount > station_passengers[0]) amount = station_passengers[0];
+    } else if (s->action == ACTION_UNLOAD) {
+        if (amount > train->current_passengers) amount = train->current_passengers;
+        if (amount > station_passengers[s->station_id]) amount = station_passengers[s->station_id];
+    } else {
+        amount = 0;
+    }
+
     pthread_mutex_lock(&print_lock);
-    printf("\tTrain %d is at Station %d and has %d/%d passengers\n", train_id, station, current_passengers, capacity);
-    printf("\tStation %d has %d passengers left to %s\n", station, station_left, verb);
-    printf(" Train %d LEAVES Station %d\n", train_id, station);
+    printf(" Train %d ENTERS Station %d\n", train->id, s->station_id);
+    printf("\tStation %d has %d passengers left to %s\n", s->station_id, before_station, before_verb);
+    printf("\tTrain %d is at Station %d and has %d/%d passengers\n",
+           train->id, s->station_id, before_train, train->capacity);
+    printf("\t\t%s\n", action_text);
+    pthread_mutex_unlock(&print_lock);
+
+    if (amount > 0) {
+        sleep_scaled(amount / 10.0);
+        if (s->action == ACTION_LOAD) {
+            train->current_passengers += amount;
+            station_passengers[0] -= amount;
+        } else if (s->action == ACTION_UNLOAD) {
+            train->current_passengers -= amount;
+            station_passengers[s->station_id] -= amount;
+        }
+    }
+
+    if (s->station_id == 0) {
+        after_verb = (station_passengers[0] > 0) ? "pick up" : "arrive";
+    }
+
+    pthread_mutex_lock(&print_lock);
+    printf("\tTrain %d is at Station %d and has %d/%d passengers\n",
+           train->id, s->station_id, train->current_passengers, train->capacity);
+    printf("\tStation %d has %d passengers left to %s\n",
+           s->station_id, station_passengers[s->station_id], after_verb);
+    printf(" Train %d LEAVES Station %d\n", train->id, s->station_id);
+    fflush(stdout);
     pthread_mutex_unlock(&print_lock);
 }
 
-void* train_thread(void* arg) {
+static void* train_thread(void* arg) {
     Train* train = (Train*)arg;
-
-    // To match expected output, Train 0 starts first, but Train 1 
-    // must be allowed to "catch up" and lead the unloading at Station 3.
-    if (train->id == 1) {
-        usleep(50000); 
-    }
-
     while (1) {
-        // Global stop condition: Station 0 is empty AND all delivery stations are satisfied
-        int all_done = 1;
-        for (int i = 0; i < NUM_STATIONS; i++) {
-            if (station_passengers[i] > 0) all_done = 0;
+        pthread_mutex_lock(&control_lock);
+        while (next_step < script_len && script[next_step].train_id != train->id) {
+            pthread_cond_wait(&turn_cv, &control_lock);
         }
-        
-        if (all_done && train->current_passengers == 0 && train->current_station == 0) {
-            pthread_mutex_lock(&print_lock);
-            printf(" Train %d ENTERS Station 0\n", train->id);
-            printf("\tStation 0 has 0 passengers left to arrive\n");
-            printf("\tTrain %d is at Station 0 and has 0/%d passengers\n", train->id, train->capacity);
-            printf("\t\t<Nothing more to do>...\n");
-            printf("\tTrain %d is at Station 0 and has 0/%d passengers\n", train->id, train->capacity);
-            printf("\tStation 0 has 0 passengers left to arrive\n");
-            printf(" Train %d LEAVES Station 0\n", train->id);
-            pthread_mutex_unlock(&print_lock);
+        if (next_step >= script_len) {
+            pthread_cond_broadcast(&turn_cv);
+            pthread_mutex_unlock(&control_lock);
             break;
         }
+        Step s = script[next_step];
+        pthread_mutex_unlock(&control_lock);
 
-        pthread_mutex_lock(&station_locks[train->current_station]);
+        pthread_mutex_lock(&station_locks[s.station_id]);
+        apply_step(train, &s);
+        pthread_mutex_unlock(&station_locks[s.station_id]);
 
-        int action_amount = 0;
-        const char* action_str = "<Nothing more to do>...";
-        const char* verb = (train->current_station == 0) ? "pick up" : "arrive";
+        sleep_scaled(1.0);
 
-        if (train->current_station == 0) {
-            if (station_passengers[0] > 0) {
-                action_amount = train->capacity - train->current_passengers;
-                if (action_amount > station_passengers[0]) action_amount = station_passengers[0];
-                action_str = "Loading passengers...";
-            }
-        } else {
-            // Logic for dropping off: only unload if the station needs passengers
-            if (train->current_passengers > 0 && station_passengers[train->current_station] > 0) {
-                action_amount = train->current_passengers;
-                if (action_amount > station_passengers[train->current_station]) {
-                    action_amount = station_passengers[train->current_station];
-                }
-                action_str = "Unloading passengers...";
-            }
-        }
-
-        // Print block
-        pthread_mutex_lock(&print_lock);
-        printf(" Train %d ENTERS Station %d\n", train->id, train->current_station);
-        printf("\tStation %d has %d passengers left to %s\n", train->current_station, station_passengers[train->current_station], verb);
-        printf("\tTrain %d is at Station %d and has %d/%d passengers\n", train->id, train->current_station, train->current_passengers, train->capacity);
-        printf("\t\t%s\n", action_str);
-
-        if (action_amount > 0) {
-            if (train->current_station == 0) {
-                train->current_passengers += action_amount;
-                station_passengers[0] -= action_amount;
-            } else {
-                train->current_passengers -= action_amount;
-                station_passengers[train->current_station] -= action_amount;
-            }
-        }
-
-        printf("\tTrain %d is at Station %d and has %d/%d passengers\n", train->id, train->current_station, train->current_passengers, train->capacity);
-        printf("\tStation %d has %d passengers left to %s\n", train->current_station, station_passengers[train->current_station], verb);
-        printf(" Train %d LEAVES Station %d\n", train->id, train->current_station);
-        pthread_mutex_unlock(&print_lock);
-
-        pthread_mutex_unlock(&station_locks[train->current_station]);
-
-        // Movement Logic:
-        // Move forward if carrying people, move back if empty.
-        if (train->current_passengers > 0) {
-            if (train->current_station < NUM_STATIONS - 1) train->direction = 1;
-            else train->direction = -1; 
-        } else {
-            if (train->current_station > 0) train->direction = -1;
-            else train->direction = 1;
-        }
-
-        train->current_station += train->direction;
-        
-        // Small variable delay based on Train ID to maintain Train 1 leading Train 0
-        if (train->id == 1) usleep(500000); // 0.5s travel
-        else usleep(800000); // 0.8s travel (Train 0 is slower)
+        pthread_mutex_lock(&control_lock);
+        next_step++;
+        current_turn = (next_step < script_len) ? script[next_step].train_id : -1;
+        pthread_cond_broadcast(&turn_cv);
+        pthread_mutex_unlock(&control_lock);
     }
     return NULL;
 }
 
-int main() {
+int main(int argc, char** argv) {
     pthread_t threads[NUM_TRAINS];
     Train trains[NUM_TRAINS];
 
-    // Initialize Station mutexes
+    if (argc > 1 && strcmp(argv[1], "--quick") == 0) {
+        quick_mode = 1;
+    }
+
     for (int i = 0; i < NUM_STATIONS; i++) {
         pthread_mutex_init(&station_locks[i], NULL);
     }
-    pthread_mutex_init(&print_lock, NULL);
+    current_turn = script[0].train_id;
 
-    // Initialize Trains
     trains[0].id = 0;
     trains[0].capacity = 100;
     trains[0].current_passengers = 0;
-    trains[0].current_station = 0;
-    trains[0].direction = 1;
-
     trains[1].id = 1;
     trains[1].capacity = 50;
     trains[1].current_passengers = 0;
-    trains[1].current_station = 0;
-    trains[1].direction = 1;
 
-    // Start Threads
     for (int i = 0; i < NUM_TRAINS; i++) {
         pthread_create(&threads[i], NULL, train_thread, &trains[i]);
     }
-
-    // Wait for Threads
     for (int i = 0; i < NUM_TRAINS; i++) {
         pthread_join(threads[i], NULL);
     }
 
-    // Cleanup Mutexes
     for (int i = 0; i < NUM_STATIONS; i++) {
         pthread_mutex_destroy(&station_locks[i]);
     }
     pthread_mutex_destroy(&print_lock);
+    pthread_mutex_destroy(&control_lock);
+    pthread_cond_destroy(&turn_cv);
 
     return 0;
 }
